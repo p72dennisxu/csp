@@ -15,6 +15,10 @@ namespace csp::python { class PyObjectStructField; }
 namespace csp::python
 {
 
+// Forward decl for the per-field data descriptor used to accelerate Python attribute access ( s.field ).
+// The descriptor type and this factory are defined further down, after the field get/set helpers.
+PyObject * PyStructFieldDescr_create( const StructField * field, PyObject * name );
+
 class PyObjectStructField final : public DialectGenericStructField
 {
 public:
@@ -253,15 +257,26 @@ static PyObject * PyStructMeta_new( PyTypeObject *subtype, PyObject *args, PyObj
     bool isStrict = strict_enabled == Py_True;
     auto structMeta = std::make_shared<DialectStructMeta>( ( PyTypeObject * ) pymeta, name, fields, isStrict, metabase );
 
-    //Setup fast attr dict lookup
+    //Install one data descriptor per field. tp_dict drives Python-level "s.field" access through CPython's
+    //generic attribute machinery ( and its type-attribute cache ); attrDict drives C++-internal name -> field
+    //resolution ( construction, update, comparison, ... ). We share a single descriptor between both dicts so
+    //neither path pays a PyCapsule unwrap. Note fields() includes inherited fields, so each struct type ends up
+    //self-contained for attribute access.
     pymeta -> attrDict = PyObjectPtr::own( PyDict_New() );
+    PyObject * typeDict = pymeta -> ht_type.tp_dict;
     for( auto & field : structMeta -> fields() )
     {
-        if( PyDict_SetItem( pymeta -> attrDict.get(),
-                            PyObjectPtr::own( PyUnicode_InternFromString( field -> fieldname().c_str() ) ).get(),
-                            PyObjectPtr::own( PyCapsule_New( field.get(), nullptr, nullptr ) ).get() ) < 0 )
+        PyObjectPtr name  = PyObjectPtr::own( PyUnicode_InternFromString( field -> fieldname().c_str() ) );
+        PyObjectPtr descr = PyObjectPtr::own( PyStructFieldDescr_create( field.get(), name.get() ) );
+        if( !descr.get() )
+            CSP_THROW( PythonPassthrough, "" );
+
+        if( PyDict_SetItem( typeDict, name.get(), descr.get() ) < 0 ||
+            PyDict_SetItem( pymeta -> attrDict.get(), name.get(), descr.get() ) < 0 )
             CSP_THROW( PythonPassthrough, "" );
     }
+    //invalidate the type-attribute cache now that we've mutated tp_dict
+    PyType_Modified( &pymeta -> ht_type );
 
     //Setup default image
     PyObject * defaults = PyDict_GetItemString( dict, "__defaults__" );
@@ -489,38 +504,12 @@ PyObject * getarrayattr_( const StructField * field, const PyStruct * pystruct )
     return v;
 }
 
-PyObject * PyStruct::getattr( PyObject * attr )
+// ( PyStruct::getattr removed: attribute reads are now served by PyStructFieldDescr via generic getattr )
+
+//Shared field-setting logic, used both by name-based setattr ( construction / update ) and by the per-field
+//data descriptor ( s.field = x / del s.field ).  attr is only used to format error messages.
+static void setattrByField( Struct * s, const StructField * field, PyObject * attr, PyObject * value )
 {
-    auto * field = structMeta() -> field( attr );
-
-    if( !field )
-        return PyObject_GenericGetAttr( this, attr );
-
-    if( !field -> isSet( struct_.get() ) )
-    {
-        if( field -> isNone( struct_.get() ) )
-            return Py_None;
-        
-        //For efficiency reasons we set err here rather than rely on exceptions, since this
-        //can get called pretty regularly, ie getattr( s, "f", default ) or hasattr checks
-        //we also pass the attribute as the exception for efficiency, expensive to format a nice error here
-        //that wont get used for hasattr calls
-        PyErr_SetObject( PyExc_AttributeError, attr );
-        return nullptr;
-    }
-
-    if( field -> type() -> type() == CspType::Type::ARRAY )
-        return getarrayattr_( field, this );
-    return getattr_( field, ( const Struct * ) struct_.get() );
-}
-
-void PyStruct::setattr( Struct * s, PyObject * attr, PyObject * value )
-{
-    auto * field = static_cast<const DialectStructMeta *>( s -> meta() ) -> field( attr );
-
-    if( !field )
-        CSP_THROW( AttributeError, "'" << s -> meta() -> name() << "' object has no attribute '" << PyUnicode_AsUTF8( attr ) << "'" );
-
     try
     {
         switchCspType( field -> type(), [field,&struct_=s,value]( auto tag )
@@ -555,6 +544,134 @@ void PyStruct::setattr( Struct * s, PyObject * attr, PyObject * value )
         CSP_THROW( TypeError, "on field '" << PyUnicode_AsUTF8( attr ) << "' : " << err.description() );
     }
 }
+
+void PyStruct::setattr( Struct * s, PyObject * attr, PyObject * value )
+{
+    auto * field = static_cast<const DialectStructMeta *>( s -> meta() ) -> field( attr );
+
+    if( !field )
+        CSP_THROW( AttributeError, "'" << s -> meta() -> name() << "' object has no attribute '" << PyUnicode_AsUTF8( attr ) << "'" );
+
+    setattrByField( s, field, attr, value );
+}
+
+//-----------------------------------------------------------------------------
+// PyStructFieldDescr
+//
+// A lightweight data descriptor installed into each struct type's tp_dict, one per field. It maps the
+// attribute directly to its StructField *, so a Python-level "s.field" access resolves through CPython's
+// generic attribute machinery ( and its type-attribute cache ) and lands here without a per-access
+// PyDict_GetItem + PyCapsule_GetPointer round-trip. Defining __set__ makes it a data descriptor, so
+// "s.field = x" and "del s.field" route here as well. The same instances are also stored in
+// PyStructMeta::attrDict, so the C++-internal field lookup ( construction, update, comparison ) is a
+// plain dict lookup with no capsule unwrap either. ( struct declared in PyStruct.h )
+//-----------------------------------------------------------------------------
+static void PyStructFieldDescr_dealloc( PyObject * descr )
+{
+    Py_XDECREF( ( ( PyStructFieldDescr * ) descr ) -> name );
+    Py_TYPE( descr ) -> tp_free( descr );
+}
+
+static PyObject * PyStructFieldDescr_get( PyObject * descr, PyObject * obj, PyObject * type )
+{
+    CSP_BEGIN_METHOD;
+
+    PyStructFieldDescr * self = ( PyStructFieldDescr * ) descr;
+
+    // attribute accessed on the class ( e.g. MyStruct.field ) -> return the descriptor itself
+    if( obj == nullptr || obj == Py_None )
+    {
+        Py_INCREF( descr );
+        return descr;
+    }
+
+    PyStruct * pystruct = ( PyStruct * ) obj;
+    const StructField * field = self -> field;
+    const Struct * s = pystruct -> struct_.get();
+
+    if( !field -> isSet( s ) )
+    {
+        if( field -> isNone( s ) )
+            Py_RETURN_NONE;
+
+        // mirror PyStruct::getattr: set the error cheaply ( attribute object as the message ) since this is
+        // hit on every hasattr / getattr-with-default probe and formatting a nice message would be wasteful
+        PyErr_SetObject( PyExc_AttributeError, self -> name );
+        return nullptr;
+    }
+
+    if( field -> type() -> type() == CspType::Type::ARRAY )
+        return getarrayattr_( field, pystruct );
+    return getattr_( field, s );
+
+    CSP_RETURN_NULL;
+}
+
+static int PyStructFieldDescr_set( PyObject * descr, PyObject * obj, PyObject * value )
+{
+    CSP_BEGIN_METHOD;
+
+    PyStructFieldDescr * self = ( PyStructFieldDescr * ) descr;
+    setattrByField( ( ( PyStruct * ) obj ) -> struct_.get(), self -> field, self -> name, value );
+
+    CSP_RETURN_INT;
+}
+
+PyObject * PyStructFieldDescr_create( const StructField * field, PyObject * name )
+{
+    PyStructFieldDescr * descr = PyObject_New( PyStructFieldDescr, &PyStructFieldDescr::PyType );
+    if( !descr )
+        return nullptr;
+
+    descr -> field = field;
+    Py_INCREF( name );
+    descr -> name = name;
+    return ( PyObject * ) descr;
+}
+
+PyTypeObject PyStructFieldDescr::PyType = {
+    PyVarObject_HEAD_INIT( nullptr, 0 )
+    "_cspimpl.PyStructFieldDescr",             /* tp_name */
+    sizeof( PyStructFieldDescr ),              /* tp_basicsize */
+    0,                                         /* tp_itemsize */
+    ( destructor ) PyStructFieldDescr_dealloc, /* tp_dealloc */
+    0,                                         /* tp_print */
+    0,                                         /* tp_getattr */
+    0,                                         /* tp_setattr */
+    0,                                         /* tp_reserved */
+    0,                                         /* tp_repr */
+    0,                                         /* tp_as_number */
+    0,                                         /* tp_as_sequence */
+    0,                                         /* tp_as_mapping */
+    0,                                         /* tp_hash */
+    0,                                         /* tp_call */
+    0,                                         /* tp_str */
+    0,                                         /* tp_getattro */
+    0,                                         /* tp_setattro */
+    0,                                         /* tp_as_buffer */
+    Py_TPFLAGS_DEFAULT,                        /* tp_flags */
+    "csp struct field descriptor",             /* tp_doc */
+    0,                                         /* tp_traverse */
+    0,                                         /* tp_clear */
+    0,                                         /* tp_richcompare */
+    0,                                         /* tp_weaklistoffset */
+    0,                                         /* tp_iter */
+    0,                                         /* tp_iternext */
+    0,                                         /* tp_methods */
+    0,                                         /* tp_members */
+    0,                                         /* tp_getset */
+    0,                                         /* tp_base */
+    0,                                         /* tp_dict */
+    ( descrgetfunc ) PyStructFieldDescr_get,   /* tp_descr_get */
+    ( descrsetfunc ) PyStructFieldDescr_set,   /* tp_descr_set */
+    0,                                         /* tp_dictoffset */
+    0,                                         /* tp_init */
+    0,                                         /* tp_alloc */
+    0,                                         /* tp_new */
+    0,                                         /* tp_free */
+};
+
+REGISTER_TYPE_INIT( &PyStructFieldDescr::PyType, "PyStructFieldDescr" )
 
 // Struct printing code
 
@@ -944,23 +1061,9 @@ PyObject * PyStruct_repr( PyStruct * self )
 }
 
 
-PyObject * PyStruct_getattro( PyStruct * self, PyObject * attr )
-{
-    CSP_BEGIN_METHOD;
-
-    return self -> getattr( attr );
-
-    CSP_RETURN_NULL;
-}
-
-int PyStruct_setattro( PyStruct * self, PyObject * attr, PyObject * value )
-{
-    CSP_BEGIN_METHOD;
-
-    self -> setattr( attr, value );
-
-    CSP_RETURN_INT;
-}
+// Note: struct attribute access ( get / set / del ) is handled by CPython's generic attribute machinery
+// ( tp_getattro = PyObject_GenericGetAttr, tp_setattro = PyObject_GenericSetAttr ) dispatching to the
+// per-field PyStructFieldDescr data descriptors installed in each struct type's tp_dict.
 
 PyObject * PyStruct_copy( PyStruct * self )
 {
@@ -1107,8 +1210,8 @@ PyTypeObject PyStruct::PyType = {
     ( hashfunc ) PyStruct_hash,  /* tp_hash  */
     0,                         /* tp_call */
     ( reprfunc ) PyStruct_str,   /* tp_str */
-    ( getattrofunc ) PyStruct_getattro, /* tp_getattro */
-    ( setattrofunc ) PyStruct_setattro, /* tp_setattro */
+    PyObject_GenericGetAttr,   /* tp_getattro */
+    PyObject_GenericSetAttr,   /* tp_setattro */
     0,                         /* tp_as_buffer */
     Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC |
        Py_TPFLAGS_BASETYPE, /* tp_flags */

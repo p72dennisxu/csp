@@ -80,6 +80,12 @@ class StructMeta(_csptypesimpl.PyStructMeta):
         dct["__optional_fields__"] = optional_fields
         dct["__strict_enabled__"] = strict
 
+        # csp.Struct stores field data in a native C++ buffer and serves attribute access via per-field
+        # descriptors; instances must not carry a per-instance __dict__. Without __slots__, CPython adds a
+        # managed dict to each subclass, which the generic attribute machinery would then use to silently
+        # accept arbitrary (non-field) attributes. An empty __slots__ suppresses that and saves memory.
+        dct.setdefault("__slots__", ())
+
         res = super().__new__(cls, name, bases, dct)
         # This is how we make sure we construct the pydantic schema from the new class
         res.__get_pydantic_core_schema__ = classmethod(res._get_pydantic_core_schema)
@@ -337,7 +343,8 @@ class Struct(_csptypesimpl.PyStruct, metaclass=StructMeta):
         return self.deepcopy()
 
     def __dir__(self):
-        return sorted(super().__dir__() + list(self.__full_metadata_typed__.keys()))
+        # field names now also appear via per-field descriptors in the type dict, so dedupe
+        return sorted(set(super().__dir__()).union(self.__full_metadata_typed__.keys()))
 
 
 def define_struct(name, metadata: dict, defaults: dict = {}, base=Struct, strict: bool = False):

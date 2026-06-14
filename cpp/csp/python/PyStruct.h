@@ -14,12 +14,23 @@ namespace csp::python
 struct CSPTYPESIMPL_EXPORT PyStructMeta : public PyHeapTypeObject
 {
     std::shared_ptr<StructMeta> structMeta;
-    PyObjectPtr                 attrDict; //mapping of attribute key -> PyCapsule holding the StructField * 
+    PyObjectPtr                 attrDict; //mapping of attribute key -> PyStructFieldDescr holding the StructField *
 
     static PyTypeObject PyType;
 };
 
-//This is an extension of csp::StructMeta for python dialect, we need it in order to 
+//Lightweight data descriptor ( one per field, installed in each struct type's tp_dict ) mapping an
+//attribute directly to its StructField *. The same instances are also stored in PyStructMeta::attrDict so
+//that C++-internal field lookups ( construction, update, comparison, ... ) avoid a PyCapsule unwrap too.
+struct CSPTYPESIMPL_EXPORT PyStructFieldDescr : public PyObject
+{
+    const StructField * field;
+    PyObject *          name;   //interned field name ( owned ref )
+
+    static PyTypeObject PyType;
+};
+
+//This is an extension of csp::StructMeta for python dialect, we need it in order to
 //keep a reference to the python struct type from conversion to/from csp::Struct <-> PyObject properly
 class CSPTYPESIMPL_EXPORT DialectStructMeta : public StructMeta
 {
@@ -32,9 +43,9 @@ public:
 
     const StructField * field( PyObject * attr ) const
     {
-        PyObject * field = PyDict_GetItem( ( ( PyStructMeta * ) m_pyType.get() ) -> attrDict.get(), attr );
-        if( field != nullptr ) [[likely]]
-            return ( StructField * ) PyCapsule_GetPointer( field, nullptr );
+        PyObject * descr = PyDict_GetItem( ( ( PyStructMeta * ) m_pyType.get() ) -> attrDict.get(), attr );
+        if( descr != nullptr ) [[likely]]
+            return ( ( PyStructFieldDescr * ) descr ) -> field;
         return nullptr;
     }
 
@@ -55,7 +66,6 @@ struct CSPTYPESIMPL_EXPORT PyStruct : public PyObject
     const DialectStructMeta * structMeta() { return static_cast<const DialectStructMeta*>( struct_ -> meta() ); }
 
     //Helper methods
-    PyObject * getattr( PyObject * attr );
     void       setattr( PyObject * attr, PyObject * value ) { setattr( struct_.get(), attr, value ); }
 
     static void setattr( Struct * s, PyObject * attr, PyObject * value );
